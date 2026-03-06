@@ -1,0 +1,18 @@
+{
+  "schedules": {
+    "local-7e96c87a-192f-4beb-a265-048cbaabd25c": {
+      "_id": "local-7e96c87a-192f-4beb-a265-048cbaabd25c",
+      "name": "Test Schedule",
+      "date": null,
+      "cases": [
+        {
+          "id": "sc-aa4efbdb-b562-4520-9bdf-566f882630d0",
+          "caseId": null,
+          "title": "Test Case Entry",
+          "addedAt": "2026-01-30T16:45:51.903Z"
+        }
+      ],
+      "createdAt": "2026-01-30T16:45:51.899Z"
+    }
+  }
+}

@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build artifacts
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Runtime files
+logs/
+*.log
+server.log
+server_out.log
+server_err.log
+logs.txt
+server/verification-report.json
+**/verification-report.json
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+server/.env
+server/.env.*
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Uploaded or generated local data
+uploads/
+analysis_cache/
+analysis_cache.pyc
+*.sqlite
+*.db
+
+# OS/editor artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local loose artifacts
+=
+argumentor UI

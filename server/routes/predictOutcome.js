@@ -5,6 +5,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 import { resolveCase } from '../lib/caseResolver.js';
+import { callLLMJson, callLLM } from '../lib/llm.js';
 
 const router = express.Router();
 
@@ -79,6 +80,46 @@ function predict_with_sentiment(features) {
   return { plaintiff: p, defendant: 1 - p };
 }
 
+function looksIncompleteOrNoisy(text) {
+  const t = String(text || '').trim();
+  if (!t) return true;
+  const noisy = /(^|\n)\s*#{2,6}\s+/m.test(t) || /\|.*\|/.test(t) || /(^|\n)\s*-{3,}\s*\|/m.test(t);
+  if (noisy) return true;
+  if (/[.!?]"?$/.test(t)) return false;
+  if (/(?:\bif|\bwhen|\bunless|\bbecause|\band|\bor|\blacks?)\s*$/i.test(t)) return true;
+  return true;
+}
+
+async function finalizeOutcomeReasoning(reasoning, text, structured, pct) {
+  const base = String(reasoning || '').trim();
+  if (!base) return '';
+  if (!looksIncompleteOrNoisy(base)) return base;
+  try {
+    const { raw } = await callLLM(
+      [
+        {
+          role: 'system',
+          content:
+            'Rewrite into clean, complete legal reasoning. Use short paragraphs and bullet points only. ' +
+            'Do not use markdown headings, tables, or pipe separators. Ensure no sentence is cut midway.'
+        },
+        {
+          role: 'user',
+          content:
+            `Draft to fix:\n${base}\n\n` +
+            `Percentages: Plaintiff ${pct.plaintiff}%, Defendant ${pct.defendant}%.\n\n` +
+            `Case excerpt:\n${String(text || '').slice(0, 5000)}\n\n` +
+            `Structured context:\n${JSON.stringify(structured || {}).slice(0, 3000)}`
+        }
+      ],
+      { max_tokens: 900, temperature: 0.1 }
+    );
+    return String(raw || '').trim() || base;
+  } catch {
+    return `${base}${base.endsWith('.') ? '' : '.'}`;
+  }
+}
+
 router.post('/predict-outcome', async (req, res) => {
   try {
     const db = req.db;
@@ -112,73 +153,95 @@ router.post('/predict-outcome', async (req, res) => {
 
     console.log(`[predictOutcome] Features: ${JSON.stringify(features)}`);
 
-    const probs = predict_with_sentiment(features);
-
-    // Use Mistral 7B for reasoning
-    const prompt = 'Given the case context and features, provide a brief rationale for predicted outcome probabilities. Explain why plaintiff has ' + Math.round(probs.plaintiff * 100) + '% chance and defendant has ' + Math.round(probs.defendant * 100) + '% chance.';
-    
-    const contextPayload = {
-      file: doc.file,
-      excerpt: text.slice(0, 1500),
-      structured,
-      features,
-      probabilities: {
-        plaintiff: Math.round(probs.plaintiff * 100),
-        defendant: Math.round(probs.defendant * 100)
-      }
+    const base = predict_with_sentiment(features);
+    const basePct = {
+      plaintiff: Math.round(base.plaintiff * 100),
+      defendant: Math.round(base.defendant * 100)
     };
 
-    const context = JSON.stringify(contextPayload);
-    const child = spawnLocalInference(prompt, context);
-
-    let stdout = '';
-    let stderr = '';
-
-    child.stdout.on('data', (d) => {
-      const chunk = d.toString();
-      stdout += chunk;
-    });
-
-    child.stderr.on('data', (d) => {
-      const chunk = d.toString();
-      stderr += chunk;
-    });
-
-    child.on('close', (code) => {
-      try {
-        let reasoning = '';
-        
-        if (code === 0) {
-          // Extract reasoning from Mistral output
-          const marker = '-- Reasoned Analysis (Mistral 7B) --';
-          const idx = stdout.indexOf(marker);
-          if (idx !== -1) {
-            const endMarker = '=== End ===';
-            let start = idx + marker.length;
-            if (stdout[start] === '\n') start += 1;
-            let end = stdout.indexOf(endMarker, start);
-            if (end === -1) end = stdout.length;
-            reasoning = stdout.slice(start, end).trim();
-          } else {
-            reasoning = stdout.slice(-2000).trim();
-          }
-        } else {
-          console.warn('[predictOutcome] Mistral inference failed, using fallback reasoning');
-          reasoning = `Based on case features: document length ${features.lengthK}K, sentiment score ${features.sentiment}, and ${features.precedents} precedents.`;
-        }
-
-        const pct = {
-          plaintiff: Math.round(probs.plaintiff * 100),
-          defendant: Math.round(probs.defendant * 100)
-        };
-        
-        console.log(`[predictOutcome] Response: ${JSON.stringify(pct)}`);
-        return res.json({ ok: true, probabilities: pct, reasoning });
-      } catch (err) {
-        console.error('[predictOutcome] Error finalizing response:', err);
-        return res.status(500).json({ ok: false, error: 'Server error during prediction processing.' });
+    const messages = [
+      {
+        role: 'system',
+        content:
+          'You are a legal outcome predictor. Return STRICT JSON only (no markdown). ' +
+          'Use the provided case excerpt and extracted structure. Give realistic percentages that sum to 100. ' +
+          'Provide convincing, case-specific justifications and list key factors.'
+      },
+      {
+        role: 'user',
+        content:
+          `Case excerpt:\n${(text || '').slice(0, 8000)}\n\n` +
+          `Extracted structure:\n${JSON.stringify(structured || {}).slice(0, 8000)}\n\n` +
+          `Heuristic baseline (you may adjust): ${JSON.stringify(basePct)}\n\n` +
+          `Return JSON shape:\n` +
+          JSON.stringify({
+            probabilities: { plaintiff: 0, defendant: 0 },
+            justification: {
+              overview: '',
+              key_factors_for_plaintiff: [],
+              key_factors_for_defendant: [],
+              biggest_uncertainties: [],
+              what_evidence_would_change_this: []
+            }
+          })
       }
-    });
+    ];
+
+    let out;
+    let narrative = null;
+    try {
+      const { json } = await callLLMJson(messages, { max_tokens: 900, temperature: 0.25 });
+      out = json && typeof json === 'object' ? json : null;
+    } catch (e) {
+      out = null;
+    }
+
+    const hasJustification = Boolean(out?.justification?.overview) || Boolean(out?.justification?.key_factors_for_plaintiff?.length) || Boolean(out?.justification?.key_factors_for_defendant?.length);
+
+    if (!out || !hasJustification) {
+      try {
+        const { raw } = await callLLM(
+          [
+            {
+              role: 'system',
+              content:
+                'You are a legal outcome predictor. Provide a convincing, case-specific justification. ' +
+                'Use bullet points and clearly separate plaintiff vs defendant factors.'
+            },
+            {
+              role: 'user',
+              content:
+                `Case excerpt:\n${(text || '').slice(0, 8000)}\n\n` +
+                `Extracted structure:\n${JSON.stringify(structured || {}).slice(0, 8000)}\n\n` +
+                `Baseline percentages: Plaintiff ${basePct.plaintiff}%, Defendant ${basePct.defendant}%.\n\n` +
+                `Write justification for these percentages and list what evidence would move the needle.`
+            }
+          ],
+          { max_tokens: 700, temperature: 0.25 }
+        );
+        narrative = String(raw || '').trim();
+      } catch {
+        narrative = null;
+      }
+    }
+
+    const p = out?.probabilities?.plaintiff;
+    const d = out?.probabilities?.defendant;
+    const plaintiffPct = Number.isFinite(p) ? Math.max(0, Math.min(100, Math.round(p))) : basePct.plaintiff;
+    const defendantPct = Number.isFinite(d) ? Math.max(0, Math.min(100, Math.round(d))) : (100 - plaintiffPct);
+    const norm = plaintiffPct + defendantPct;
+    const pct = norm === 100 ? { plaintiff: plaintiffPct, defendant: defendantPct } : { plaintiff: plaintiffPct, defendant: 100 - plaintiffPct };
+
+    let reasoning =
+      out?.justification?.overview
+        ? String(out.justification.overview).trim() +
+          `\n\nKey factors for plaintiff:\n- ${(out.justification.key_factors_for_plaintiff || []).slice(0, 6).join('\n- ')}` +
+          `\n\nKey factors for defendant:\n- ${(out.justification.key_factors_for_defendant || []).slice(0, 6).join('\n- ')}`
+        : (narrative || `Baseline features: length ${features.lengthK}K, sentiment ${features.sentiment}, precedents ${features.precedents}.`);
+
+    reasoning = await finalizeOutcomeReasoning(reasoning, text, structured, pct);
+
+    return res.json({ ok: true, probabilities: pct, reasoning });
 
   } catch (e) {
     console.error(`[predictOutcome] Exception: ${e.message}`, e);

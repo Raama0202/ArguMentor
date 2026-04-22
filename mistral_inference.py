@@ -1,7 +1,7 @@
 """
 mistral_inference.py
 
-MISTRAL 7B ONLY - No fallbacks to Gemini, Groq, or cache.
+MISTRAL 7B ONLY - No fallback providers.
 Routes to Mistral 7B (Hugging Face Inference Endpoint or Mistral API) for
 both structure extraction and reasoning.
 

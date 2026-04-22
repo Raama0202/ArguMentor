@@ -8,6 +8,9 @@ echo   ArguMentor 2.0 - Launching System
 echo ========================================
 echo.
 
+REM Set PATH to include local Node.js
+set PATH=%~dp0.tools\node-v20.20.2-win-x64;%PATH%
+
 echo Starting Server (port 5000)...
 start "Argumentor Server" cmd /k "cd /d ""%~dp0server"" && npm run dev"
 

@@ -1,8 +1,124 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { io } from 'socket.io-client';
-import { Scale, Upload, FileText, TrendingUp, Target, Database, ChevronDown, User, Settings, LogOut, RefreshCw, Copy, CheckCircle, AlertCircle, Clock, BarChart3, Sparkles, MessageSquare, Send, Bot, UserCircle, Paperclip, Mic, Trash2 } from 'lucide-react';
+import { Scale, Upload, FileText, TrendingUp, Target, Database, ChevronDown, User, Settings, LogOut, RefreshCw, Copy, Clock, BarChart3, Sparkles, MessageSquare, Send, Bot, UserCircle, Paperclip, Mic, Trash2 } from 'lucide-react';
 import OutcomeWidget from './OutcomeWidget';
 import SchedulePanel from './SchedulePanel';
+
+function linkifyInline(text: string, keyPrefix: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  const mdOrUrl = /(\[([^\]]+)\]\((https?:\/\/[^\s)]+)\))|(https?:\/\/[^\s]+)/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  let idx = 0;
+  while ((m = mdOrUrl.exec(text)) !== null) {
+    const start = m.index;
+    if (start > last) out.push(<span key={`${keyPrefix}-t-${idx++}`}>{text.slice(last, start)}</span>);
+    const label = m[2];
+    const mdUrl = m[3];
+    const bareUrl = m[4];
+    const href = mdUrl || bareUrl;
+    if (href) {
+      out.push(
+        <a key={`${keyPrefix}-a-${idx++}`} href={href} target="_blank" rel="noopener noreferrer" className="text-blue-300 underline break-all">
+          {label || href}
+        </a>
+      );
+    }
+    last = mdOrUrl.lastIndex;
+  }
+  if (last < text.length) out.push(<span key={`${keyPrefix}-t-${idx++}`}>{text.slice(last)}</span>);
+  return out;
+}
+
+function cleanAssistantText(raw: string): string {
+  const input = String(raw || '');
+  if (!input.trim()) return '';
+
+  const cleanedLines = input
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .map((line) => line.replace(/^\s*#{1,6}\s+/, ''))
+    .filter((line) => line && !/^\|[-\s|:]+\|?$/.test(line) && !/^\|.*\|$/.test(line) && !/attachment:/i.test(line))
+    .map((line) =>
+      line
+        .replace(/\*\*([^*]+)\*\*/g, '$1')
+        .replace(/\*([^*]+)\*/g, '$1')
+        .replace(/`([^`]+)`/g, '$1')
+        .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '$1 - $2')
+        .replace(/\s{2,}/g, ' ')
+        .trim()
+    )
+    .filter(Boolean);
+
+  // Remove entire comparison sections unless user explicitly asked.
+  const withoutComparison: string[] = [];
+  let skipComparison = false;
+  for (const line of cleanedLines) {
+    const l = line.toLowerCase();
+    if (/\bcomparison\b/.test(l) || /\bold vs\b/.test(l) || /\bupdated position\b/.test(l)) {
+      skipComparison = true;
+      continue;
+    }
+    if (skipComparison) {
+      if (/^\d+\)/.test(l) || /source references|confidence/.test(l)) {
+        skipComparison = false;
+        withoutComparison.push(line);
+      }
+      continue;
+    }
+    withoutComparison.push(line);
+  }
+
+  // Drop obviously dangling tail fragments.
+  while (withoutComparison.length) {
+    const last = withoutComparison[withoutComparison.length - 1];
+    if (
+      /\[[^\]]*$/.test(last) ||
+      /\([^\)]*$/.test(last) ||
+      /\|/.test(last) ||
+      /(?:\bif|\bwhen|\bunless|\bbecause|\band|\bor|\bwith|\bunder)\s*$/i.test(last)
+    ) {
+      withoutComparison.pop();
+      continue;
+    }
+    break;
+  }
+
+  let out = withoutComparison.join('\n').trim();
+  if (out && !/[.!?]"?$/.test(out)) out = `${out}.`;
+  return out;
+}
+
+function renderFormattedText(text: string, keyPrefix: string): React.ReactNode {
+  const lines = String(text || '').split(/\r?\n/);
+  const nodes: React.ReactNode[] = [];
+  let listItems: string[] = [];
+  const flushList = (k: string) => {
+    if (!listItems.length) return;
+    nodes.push(
+      <ul key={`${k}-ul`} className="list-disc pl-5 space-y-1">
+        {listItems.map((it, i) => <li key={`${k}-li-${i}`}>{linkifyInline(it, `${k}-li-${i}`)}</li>)}
+      </ul>
+    );
+    listItems = [];
+  };
+  lines.forEach((raw, i) => {
+    const line = raw.trim();
+    const isBullet = /^[-*]\s+/.test(line) || /^\d+\.\s+/.test(line);
+    if (!line) {
+      flushList(`${keyPrefix}-b-${i}`);
+      return;
+    }
+    if (isBullet) {
+      listItems.push(line.replace(/^([-*]|\d+\.)\s+/, ''));
+    } else {
+      flushList(`${keyPrefix}-p-${i}`);
+      nodes.push(<p key={`${keyPrefix}-p-${i}`} className="leading-relaxed">{linkifyInline(line, `${keyPrefix}-p-${i}`)}</p>);
+    }
+  });
+  flushList(`${keyPrefix}-end`);
+  return <div className="space-y-2">{nodes}</div>;
+}
 
 const App: React.FC = () => {
   const API_BASE = window.location.origin;
@@ -11,7 +127,7 @@ const App: React.FC = () => {
   const [showProfile, setShowProfile] = useState(false);
   const [uploadedFiles, setUploadedFiles] = useState<Array<{ id: string; name: string; date: string; size?: string }>>([]);
   const [loadingCases, setLoadingCases] = useState(true);
-  const [activeResultTab, setActiveResultTab] = useState<'summary' | 'entities' | 'evidence'>('summary');
+  const [activeResultTab, setActiveResultTab] = useState<'summary' | 'entities' | 'evidence' | 'timeline' | 'issues' | 'arguments' | 'precedents' | 'recommendations'>('summary');
   const [chatMessages, setChatMessages] = useState<Array<{ id: number; sender: 'bot' | 'user'; text: string; timestamp: string }>>([
     {
       id: 1,
@@ -40,6 +156,12 @@ const App: React.FC = () => {
   const [caseId, setCaseId] = useState<string>('');
   const [customQuery, setCustomQuery] = useState<string>('Summarize and extract entities and arguments.');
   const [analysisResult, setAnalysisResult] = useState<{ summary?: string; reasoning?: string; structured?: any } | null>(null);
+
+  // Counterarguments state
+  const [counterSide, setCounterSide] = useState<'both' | 'petitioner' | 'respondent'>('both');
+  const [counterLoading, setCounterLoading] = useState(false);
+  const [counterError, setCounterError] = useState<string | null>(null);
+  const [counterItems, setCounterItems] = useState<Array<{ title: string; text: string; confidence?: string }>>([]);
 
   const tabs = [
     { id: 'dashboard', label: 'Dashboard', icon: BarChart3 },
@@ -77,7 +199,18 @@ const App: React.FC = () => {
         return out;
       });
     });
-    s.on('chat:end', () => setIsTyping(false));
+    s.on('chat:end', (payload?: { full?: string }) => {
+      setIsTyping(false);
+      setChatMessages(prev => {
+        if (!prev.length) return prev;
+        const out = [...prev];
+        const idx = out.length - 1;
+        if (out[idx]?.sender !== 'bot') return out;
+        const best = String(payload?.full || out[idx].text || '');
+        out[idx] = { ...out[idx], text: cleanAssistantText(best) };
+        return out;
+      });
+    });
     s.on('chat:error', () => setIsTyping(false));
     return () => { try { s.disconnect(); } catch {} };
   }, []);
@@ -175,6 +308,7 @@ const App: React.FC = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           clientId: clientIdentifier,
+          caseId: caseId || undefined,
           history: updatedHistory.map(m => ({ role: m.sender, content: m.text })),
           message: trimmed
         })
@@ -222,9 +356,7 @@ const App: React.FC = () => {
       
       if (!resp.ok) {
         const errorMsg = data?.error || 'Analysis failed';
-        // Remove any Groq references from error messages
-        const cleanError = errorMsg.replace(/groq|Groq|GROQ/gi, 'Mistral 7B');
-        throw new Error(cleanError);
+        throw new Error(errorMsg);
       }
       
       if (!data.ok) {
@@ -232,7 +364,7 @@ const App: React.FC = () => {
       }
       
       setAnalysisResult({
-        summary: data.summary || data.reasoning?.slice(0, 1000) || 'Analysis completed',
+        summary: data.summary || data.reasoning || 'Analysis completed',
         reasoning: data.reasoning || '',
         structured: data.structured || {}
       });
@@ -240,15 +372,37 @@ const App: React.FC = () => {
     } catch (e: any) {
       console.error('[Analysis] Error:', e);
       const errorMsg = e.message || 'Analysis failed';
-      // Ensure no Groq references
-      const cleanError = errorMsg.replace(/groq|Groq|GROQ/gi, 'Mistral 7B');
-      setAnalysisResult({ summary: `Error: ${cleanError}` });
-      setUploadError(cleanError);
+      setAnalysisResult({ summary: `Error: ${errorMsg}` });
+      setUploadError(errorMsg);
       setTimeout(() => setUploadError(null), 5000);
     } finally {
       setProcessing(false);
     }
   };
+
+  const runCounterarguments = useCallback(async () => {
+    if (!caseId) return;
+    setCounterLoading(true);
+    setCounterError(null);
+    try {
+      const resp = await fetch(`${API_BASE}/api/generate-counterarguments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ caseId, side: counterSide })
+      });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok || !data?.ok) {
+        throw new Error(data?.error || `Failed to generate counterarguments (${resp.status})`);
+      }
+      setCounterItems(Array.isArray(data.counters) ? data.counters : []);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Counterargument generation failed';
+      setCounterError(msg);
+      setCounterItems([]);
+    } finally {
+      setCounterLoading(false);
+    }
+  }, [API_BASE, caseId, counterSide]);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -258,8 +412,12 @@ const App: React.FC = () => {
     setUploadSuccess(null);
     try {
       const data = await uploadDocument(file, `Initial ingestion for ${file.name}`);
-      await fetchCases(data.id);
-      setCaseId(prev => prev || data.id);
+      setUploadedFiles(prev => {
+        const next = [{ id: data.id, name: file.name, date: new Date().toLocaleDateString() }, ...prev.filter(x => x.id !== data.id)];
+        return next;
+      });
+      setCaseId(data.id);
+      fetchCases(data.id).catch(() => {});
       setUploadSuccess(`Uploaded ${file.name}`);
     } catch (err: any) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -278,8 +436,12 @@ const App: React.FC = () => {
     setChatUploading(true);
     try {
       const data = await uploadDocument(file, `Analyze the attachment "${file.name}" and incorporate it into the active conversation context.`);
-      await fetchCases(data.id);
-      setCaseId(prev => prev || data.id);
+      setUploadedFiles(prev => {
+        const next = [{ id: data.id, name: file.name, date: new Date().toLocaleDateString() }, ...prev.filter(x => x.id !== data.id)];
+        return next;
+      });
+      setCaseId(data.id);
+      fetchCases(data.id).catch(() => {});
       await sendChatMessage(`Attachment uploaded: ${file.name}. Reference Case ID ${data.id} for analysis.`, { preserveInput: true });
       setChatAttachmentStatus({ message: `Attachment uploaded: ${file.name}`, tone: 'success' });
     } catch (error) {
@@ -365,6 +527,66 @@ const App: React.FC = () => {
     }
   };
 
+  const handleGenerateDefaultMemo = async () => {
+    if (!caseId.trim()) {
+      setMemoStatus({ message: 'Please select or upload a case before generating a memo.', tone: 'error' });
+      return;
+    }
+
+    setMemoStatus({ message: 'Generating memo with default template...', tone: 'info' });
+
+    try {
+      const formData = new FormData();
+      formData.append('caseId', caseId);
+
+      const resp = await fetch(`${API_BASE}/api/memo/generate-default`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      const contentType = resp.headers.get('Content-Type') || '';
+      if (!resp.ok) {
+        let errorMessage = `Memo generation failed (${resp.status})`;
+        if (contentType.includes('application/json')) {
+          const data = await resp.json().catch(() => null);
+          if (data?.error) {
+            errorMessage = data.error;
+          }
+        } else {
+          const text = await resp.text().catch(() => '');
+          if (text) {
+            errorMessage = text.slice(0, 300);
+          }
+        }
+        setMemoStatus({ message: errorMessage, tone: 'error' });
+        return;
+      }
+
+      const blob = await resp.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+
+      const disposition = resp.headers.get('Content-Disposition') || '';
+      let filename = 'legal-memo.txt';
+      const match = /filename="([^"]+)"/i.exec(disposition);
+      if (match && match[1]) {
+        filename = match[1];
+      }
+
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+
+      setMemoStatus({ message: `Memo downloaded as ${filename}`, tone: 'success' });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Memo generation failed';
+      setMemoStatus({ message, tone: 'error' });
+    }
+  };
+
   const handleDeleteCase = async (caseIdToDelete: string, e?: React.MouseEvent) => {
     if (e) {
       e.stopPropagation(); // Prevent case selection when clicking delete
@@ -374,6 +596,10 @@ const App: React.FC = () => {
       return;
     }
 
+    const snapshot = uploadedFiles;
+    const prevCaseId = caseId;
+    setUploadedFiles(prev => prev.filter(f => f.id !== caseIdToDelete));
+    if (caseId === caseIdToDelete) setCaseId('');
     try {
       console.log(`[Delete] Attempting to delete case: ${caseIdToDelete}`);
       const resp = await fetch(`${API_BASE}/api/cases/${encodeURIComponent(caseIdToDelete)}`, {
@@ -397,20 +623,16 @@ const App: React.FC = () => {
       console.log(`[Delete] Response:`, data);
       
       if (resp.ok && data.ok) {
-        // Remove from local state
-        setUploadedFiles(prev => prev.filter(f => f.id !== caseIdToDelete));
-        // Clear selected case if it was deleted
-        if (caseId === caseIdToDelete) {
-          setCaseId('');
-        }
         setUploadSuccess(`Case deleted successfully`);
         setTimeout(() => setUploadSuccess(null), 3000);
-        // Refresh cases list
-        await fetchCases();
+        // Background refresh for consistency without blocking UI.
+        fetchCases().catch(() => {});
       } else {
         throw new Error(data.error || `Delete failed: ${resp.status}`);
       }
     } catch (error) {
+      setUploadedFiles(snapshot);
+      setCaseId(prevCaseId);
       console.error('[Delete] Error:', error);
       const message = error instanceof Error ? error.message : 'Delete failed';
       setUploadError(`Delete failed: ${message}`);
@@ -629,7 +851,7 @@ const App: React.FC = () => {
                                 ? 'bg-gradient-to-br from-amber-600/20 to-amber-700/20 border border-amber-500/30'
                                 : 'bg-slate-800/80 border border-blue-500/20'
                             }`}>
-                              <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.text}</p>
+                              {renderFormattedText(message.text, `msg-${message.id}`)}
                             </div>
                             <p className={`text-xs text-slate-500 mt-1 ${message.sender === 'user' ? 'text-right' : 'text-left'}`}>{message.timestamp}</p>
                           </div>
@@ -769,6 +991,14 @@ const App: React.FC = () => {
                     >
                       Generate & Download Memo
                     </button>
+                    <div className="text-center text-xs text-slate-500 my-2">or</div>
+                    <button
+                      onClick={handleGenerateDefaultMemo}
+                      className="w-full bg-gradient-to-r from-green-600 to-green-700 hover:from-green-500 hover:to-green-600 rounded-lg py-2 text-sm font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                      disabled={!caseId.trim()}
+                    >
+                      Use Default Template
+                    </button>
                     {memoStatus && (
                       <p
                         className={`text-xs mt-1 ${
@@ -890,8 +1120,8 @@ const App: React.FC = () => {
               </div>
               <div className="bg-slate-900/60 backdrop-blur-lg rounded-2xl border border-blue-500/20 p-6 shadow-2xl">
                 <h2 className="text-lg font-bold mb-4 text-amber-400">Analysis Results</h2>
-                <div className="flex space-x-2 mb-4">
-                  {['summary', 'entities', 'evidence'].map((tab) => (
+                <div className="flex flex-wrap gap-2 mb-4">
+                  {['summary', 'entities', 'evidence', 'timeline', 'issues', 'arguments', 'precedents', 'recommendations'].map((tab) => (
                     <button
                       key={tab}
                       onClick={() => setActiveResultTab(tab as typeof activeResultTab)}
@@ -915,32 +1145,135 @@ const App: React.FC = () => {
                           )}
                         </>
                       ) : (
-                        <>
-                          <p><span className="text-amber-400 font-semibold">Case Type:</span> Contract Dispute</p>
-                          <p><span className="text-amber-400 font-semibold">Parties:</span> Smith vs Jones</p>
-                          <p className="mt-4">The analysis reveals three primary arguments from the plaintiff centered on explicit contractual obligations.</p>
-                        </>
+                        <p className="text-slate-500">Run analysis to view results.</p>
                       )}
                     </div>
                   )}
                   {activeResultTab === 'entities' && (
                     <div className="space-y-2 text-sm text-slate-300 animate-in fade-in duration-300">
-                      {analysisResult?.structured?.entities?.length ? (
+                      {Array.isArray(analysisResult?.structured?.involved_entities) && analysisResult?.structured?.involved_entities?.length ? (
+                        analysisResult.structured.involved_entities.map((e: any, idx: number) => (
+                          <div key={idx} className="bg-slate-900/60 border border-slate-700 rounded-lg p-3">
+                            <div className="font-semibold text-slate-200">{e?.name || 'Entity'}</div>
+                            <div className="text-xs text-slate-400 mt-1">
+                              {(e?.type ? `Type: ${e.type}` : '')}{e?.role ? ` • Role: ${e.role}` : ''}{e?.side ? ` • Side: ${e.side}` : ''}
+                            </div>
+                            {e?.notes && <div className="text-sm text-slate-300 mt-2 whitespace-pre-wrap">{e.notes}</div>}
+                          </div>
+                        ))
+                      ) : Array.isArray(analysisResult?.structured?.entities) && analysisResult?.structured?.entities?.length ? (
                         analysisResult.structured.entities.map((e: any, idx: number) => (
                           <div key={idx} className="bg-slate-900/60 border border-slate-700 rounded-lg p-3">{typeof e === 'string' ? e : JSON.stringify(e)}</div>
                         ))
-                      ) : (
-                        <p className="text-slate-500">No entities available.</p>
-                      )}
+                      ) : <p className="text-slate-500">No entities available.</p>}
                     </div>
                   )}
                   {activeResultTab === 'evidence' && (
                     <div className="space-y-2 text-sm text-slate-300 animate-in fade-in duration-300">
-                      {analysisResult?.structured ? (
+                      {Array.isArray(analysisResult?.structured?.evidence) && analysisResult?.structured?.evidence?.length ? (
+                        analysisResult.structured.evidence.map((ev: any, idx: number) => (
+                          <div key={idx} className="bg-slate-900/60 border border-slate-700 rounded-lg p-3">
+                            <div className="flex items-center justify-between">
+                              <div className="font-semibold text-slate-200">{ev?.id || `Evidence ${idx + 1}`}</div>
+                              <div className="text-xs text-slate-400">{ev?.type || ''}</div>
+                            </div>
+                            {ev?.description && <div className="text-sm mt-2 whitespace-pre-wrap">{ev.description}</div>}
+                            {(ev?.relevance || ev?.supports) && (
+                              <div className="text-xs text-slate-400 mt-2">
+                                {ev?.relevance ? `Relevance: ${ev.relevance}` : ''}{ev?.supports ? ` • Supports: ${ev.supports}` : ''}
+                              </div>
+                            )}
+                            {ev?.weaknesses && <div className="text-xs text-amber-300 mt-2">Weaknesses: {ev.weaknesses}</div>}
+                          </div>
+                        ))
+                      ) : analysisResult?.structured ? (
                         <pre className="whitespace-pre-wrap text-xs">{JSON.stringify(analysisResult.structured, null, 2)}</pre>
-                      ) : (
-                        <p className="text-slate-500">Run analysis to view structured data.</p>
-                      )}
+                      ) : <p className="text-slate-500">Run analysis to view structured data.</p>}
+                    </div>
+                  )}
+                  {activeResultTab === 'timeline' && (
+                    <div className="space-y-2 text-sm text-slate-300 animate-in fade-in duration-300">
+                      {Array.isArray(analysisResult?.structured?.timeline) && analysisResult?.structured?.timeline?.length ? (
+                        analysisResult.structured.timeline.map((t: any, idx: number) => (
+                          <div key={idx} className="bg-slate-900/60 border border-slate-700 rounded-lg p-3">
+                            <div className="text-xs text-slate-400">{t?.date || `Event ${idx + 1}`}</div>
+                            <div className="text-sm mt-1 whitespace-pre-wrap">{t?.event || ''}</div>
+                            {t?.source && <div className="text-xs text-slate-500 mt-1">Source: {t.source}</div>}
+                          </div>
+                        ))
+                      ) : <p className="text-slate-500">No timeline extracted.</p>}
+                    </div>
+                  )}
+                  {activeResultTab === 'issues' && (
+                    <div className="space-y-2 text-sm text-slate-300 animate-in fade-in duration-300">
+                      {Array.isArray(analysisResult?.structured?.issues) && analysisResult?.structured?.issues?.length ? (
+                        analysisResult.structured.issues.map((it: any, idx: number) => (
+                          <div key={idx} className="bg-slate-900/60 border border-slate-700 rounded-lg p-3">
+                            <div className="font-semibold text-slate-200">{it?.issue || `Issue ${idx + 1}`}</div>
+                            {it?.standard && <div className="text-xs text-slate-400 mt-1">Standard: {it.standard}</div>}
+                            {it?.notes && <div className="text-sm mt-2 whitespace-pre-wrap">{it.notes}</div>}
+                          </div>
+                        ))
+                      ) : <p className="text-slate-500">No issues extracted.</p>}
+                    </div>
+                  )}
+                  {activeResultTab === 'arguments' && (
+                    <div className="space-y-3 text-sm text-slate-300 animate-in fade-in duration-300">
+                      <div>
+                        <div className="text-amber-400 font-semibold mb-2">Claims</div>
+                        {Array.isArray(analysisResult?.structured?.claims) && analysisResult?.structured?.claims?.length ? (
+                          analysisResult.structured.claims.map((c: any, idx: number) => (
+                            <div key={idx} className="bg-slate-900/60 border border-slate-700 rounded-lg p-3 mb-2">
+                              <div className="font-semibold text-slate-200">{c?.claim || `Claim ${idx + 1}`}</div>
+                              {Array.isArray(c?.elements) && c.elements.length > 0 && (
+                                <div className="text-xs text-slate-400 mt-1">Elements: {c.elements.join(', ')}</div>
+                              )}
+                              {c?.support && <div className="text-sm mt-2 whitespace-pre-wrap">{c.support}</div>}
+                              {c?.weaknesses && <div className="text-xs text-amber-300 mt-2">Weaknesses: {c.weaknesses}</div>}
+                            </div>
+                          ))
+                        ) : <div className="text-slate-500">No claims extracted.</div>}
+                      </div>
+                      <div>
+                        <div className="text-amber-400 font-semibold mb-2">Defenses</div>
+                        {Array.isArray(analysisResult?.structured?.defenses) && analysisResult?.structured?.defenses?.length ? (
+                          analysisResult.structured.defenses.map((d: any, idx: number) => (
+                            <div key={idx} className="bg-slate-900/60 border border-slate-700 rounded-lg p-3 mb-2">
+                              <div className="font-semibold text-slate-200">{d?.defense || `Defense ${idx + 1}`}</div>
+                              {d?.support && <div className="text-sm mt-2 whitespace-pre-wrap">{d.support}</div>}
+                              {d?.weaknesses && <div className="text-xs text-amber-300 mt-2">Weaknesses: {d.weaknesses}</div>}
+                            </div>
+                          ))
+                        ) : <div className="text-slate-500">No defenses extracted.</div>}
+                      </div>
+                    </div>
+                  )}
+                  {activeResultTab === 'precedents' && (
+                    <div className="space-y-2 text-sm text-slate-300 animate-in fade-in duration-300">
+                      {Array.isArray(analysisResult?.structured?.precedents) && analysisResult?.structured?.precedents?.length ? (
+                        analysisResult.structured.precedents.map((p: any, idx: number) => (
+                          <div key={idx} className="bg-slate-900/60 border border-slate-700 rounded-lg p-3">
+                            <div className="font-semibold text-slate-200">{p?.citation || `Precedent ${idx + 1}`}</div>
+                            {p?.holding && <div className="text-sm mt-2 whitespace-pre-wrap">{p.holding}</div>}
+                            {p?.relevance && <div className="text-xs text-slate-400 mt-2">Relevance: {p.relevance}</div>}
+                          </div>
+                        ))
+                      ) : <p className="text-slate-500">No precedents extracted.</p>}
+                    </div>
+                  )}
+                  {activeResultTab === 'recommendations' && (
+                    <div className="space-y-2 text-sm text-slate-300 animate-in fade-in duration-300">
+                      {Array.isArray(analysisResult?.structured?.recommendations) && analysisResult?.structured?.recommendations?.length ? (
+                        analysisResult.structured.recommendations.map((r: any, idx: number) => (
+                          <div key={idx} className="bg-slate-900/60 border border-slate-700 rounded-lg p-3">
+                            <div className="flex items-center justify-between">
+                              <div className="font-semibold text-slate-200">{r?.action || `Recommendation ${idx + 1}`}</div>
+                              <div className="text-xs text-slate-400">{r?.priority || ''}</div>
+                            </div>
+                            {r?.why && <div className="text-sm mt-2 whitespace-pre-wrap">{r.why}</div>}
+                          </div>
+                        ))
+                      ) : <p className="text-slate-500">No recommendations extracted.</p>}
                     </div>
                   )}
                 </div>
@@ -1013,52 +1346,62 @@ const App: React.FC = () => {
               <Target className="w-8 h-8 text-amber-400" />
               <span>Counterargument Generator</span>
             </h1>
-            <div className="mb-6 bg-slate-900/60 backdrop-blur-lg rounded-2xl border border-blue-500/20 p-6 shadow-2xl">
-              <label className="text-sm text-slate-400 mb-2 block">Select Case</label>
-              <select
-                value={caseId}
-                onChange={(e) => setCaseId(e.target.value)}
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 text-white focus:border-blue-500 focus:outline-none transition-colors"
-              >
-                <option value="">Choose a case...</option>
-                {uploadedFiles.map((file) => (
-                  <option key={file.id} value={file.id}>
-                    {file.name} ({file.date})
-                  </option>
-                ))}
-              </select>
+            <div className="mb-6 bg-slate-900/60 backdrop-blur-lg rounded-2xl border border-blue-500/20 p-6 shadow-2xl space-y-4">
+              <div>
+                <label className="text-sm text-slate-400 mb-2 block">Select Case</label>
+                <select
+                  value={caseId}
+                  onChange={(e) => setCaseId(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 text-white focus:border-blue-500 focus:outline-none transition-colors"
+                >
+                  <option value="">Choose a case...</option>
+                  {uploadedFiles.map((file) => (
+                    <option key={file.id} value={file.id}>
+                      {file.name} ({file.date})
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex flex-wrap gap-2 items-center">
+                <label className="text-sm text-slate-400">Counter side</label>
+                <select
+                  value={counterSide}
+                  onChange={(e) => setCounterSide(e.target.value as any)}
+                  className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white"
+                >
+                  <option value="both">Both</option>
+                  <option value="petitioner">Petitioner</option>
+                  <option value="respondent">Respondent</option>
+                </select>
+                <button
+                  onClick={runCounterarguments}
+                  disabled={!caseId || counterLoading}
+                  className="ml-auto px-4 py-2 bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-500 hover:to-blue-600 disabled:opacity-50 rounded-lg font-semibold"
+                >
+                  {counterLoading ? 'Generating…' : 'Generate'}
+                </button>
+              </div>
+              {counterError && <div className="text-xs text-red-400">{counterError}</div>}
             </div>
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <div className="bg-slate-900/60 backdrop-blur-lg rounded-2xl border border-blue-500/20 p-6 shadow-2xl">
                 <h2 className="text-lg font-bold mb-4 text-amber-400">Extracted Arguments</h2>
                 <div className="space-y-4">
-                  <div className="bg-blue-900/20 border border-blue-500/30 rounded-lg p-4 transform transition-all duration-300 hover:scale-[1.02] animate-in slide-in-from-left-4">
-                    <p className="text-xs text-blue-400 font-semibold mb-2">PETITIONER</p>
-                    <p className="text-sm text-slate-300">The defendant violated the non-compete clause by engaging with a direct competitor within the restricted period.</p>
-                    <div className="mt-2 flex items-center space-x-2">
-                      <div className="h-1.5 bg-slate-700 rounded-full flex-1 overflow-hidden">
-                        <div className="h-full bg-blue-500 rounded-full animate-in slide-in-from-left duration-1000" style={{ width: '85%' }} />
-                      </div>
-                      <span className="text-xs text-slate-400">85%</span>
+                  {counterItems.length ? counterItems.slice(0, 4).map((item, i) => (
+                    <div key={i} className="bg-slate-800/60 border border-slate-700 rounded-lg p-4">
+                      <p className="text-xs text-blue-300 font-semibold mb-2">{item.title || `ARGUMENT ${i + 1}`}</p>
+                      <div className="text-sm text-slate-300">{renderFormattedText(item.text || '', `counter-left-${i}`)}</div>
                     </div>
-                  </div>
-                  <div className="bg-red-900/20 border border-red-500/30 rounded-lg p-4 transform transition-all duration-300 hover:scale-[1.02] animate-in slide-in-from-left-4" style={{ animationDelay: '100ms' }}>
-                    <p className="text-xs text-red-400 font-semibold mb-2">RESPONDENT</p>
-                    <p className="text-sm text-slate-300">The non-compete clause is overly broad and unenforceable under state law, limiting legitimate career opportunities.</p>
-                    <div className="mt-2 flex items-center space-x-2">
-                      <div className="h-1.5 bg-slate-700 rounded-full flex-1 overflow-hidden">
-                        <div className="h-full bg-red-500 rounded-full animate-in slide-in-from-left duration-1000" style={{ width: '72%', animationDelay: '100ms' }} />
-                      </div>
-                      <span className="text-xs text-slate-400">72%</span>
-                    </div>
-                  </div>
+                  )) : (
+                    <p className="text-sm text-slate-400">Click Generate to extract and build case-specific arguments.</p>
+                  )}
                 </div>
               </div>
               <div className="bg-slate-900/60 backdrop-blur-lg rounded-2xl border border-blue-500/20 p-6 shadow-2xl">
                 <div className="flex items-center justify-between mb-4">
                   <h2 className="text-lg font-bold text-amber-400">AI-Generated Counterarguments</h2>
                   <div className="flex space-x-2">
-                    <button className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg transition-all hover:scale-110">
+                    <button onClick={runCounterarguments} className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg transition-all hover:scale-110">
                       <RefreshCw className="w-4 h-4" />
                     </button>
                     <button className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg transition-all hover:scale-110">
@@ -1067,21 +1410,17 @@ const App: React.FC = () => {
                   </div>
                 </div>
                 <div className="space-y-4">
-                  {[
-                    { title: 'COUNTER TO PETITIONER', confidence: 'High', icon: CheckCircle, color: 'green', text: 'Challenge the reasonableness of geographic and temporal restrictions. Cite precedents where courts found similar clauses overly restrictive.' },
-                    { title: 'COUNTER TO RESPONDENT', confidence: 'Medium', icon: AlertCircle, color: 'amber', text: 'Demonstrate legitimate business interests requiring protection. Present evidence of proprietary information access and competitive harm.' }
-                  ].map((counter, idx) => (
-                    <div key={idx} className="bg-purple-900/20 border border-purple-500/30 rounded-lg p-4 transform transition-all duration-300 hover:scale-[1.02] animate-in slide-in-from-right-4" style={{ animationDelay: `${idx * 100}ms` }}>
+                  {counterItems.length ? counterItems.map((counter, idx) => (
+                    <div key={idx} className="bg-purple-900/20 border border-purple-500/30 rounded-lg p-4 transform transition-all duration-300 hover:scale-[1.02] animate-in slide-in-from-right-4" style={{ animationDelay: `${idx * 50}ms` }}>
                       <div className="flex items-center justify-between mb-2">
-                        <p className="text-xs text-purple-400 font-semibold">{counter.title}</p>
-                        <div className="flex items-center space-x-1">
-                          <counter.icon className={`w-3 h-3 text-${counter.color}-400`} />
-                          <span className="text-xs text-slate-400">{counter.confidence} Confidence</span>
-                        </div>
+                        <p className="text-xs text-purple-200 font-semibold">{counter.title || `COUNTER ${idx + 1}`}</p>
+                        <span className="text-xs text-slate-400">{counter.confidence || 'Medium'} Confidence</span>
                       </div>
-                      <p className="text-sm text-slate-300">{counter.text}</p>
+                      <p className="text-sm text-slate-300 whitespace-pre-wrap">{counter.text}</p>
                     </div>
-                  ))}
+                  )) : (
+                    <p className="text-sm text-slate-400">Generate to see case-specific counterarguments.</p>
+                  )}
                 </div>
               </div>
             </div>

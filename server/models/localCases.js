@@ -68,3 +68,18 @@ export function deleteCase(id) {
     return false;
   }
 }
+
+export function updateCase(id, patch) {
+  try {
+    const cases = loadAll();
+    const key = cases[id] ? id : Object.keys(cases).find(k => cases[k]?._id === id || cases[k]?.caseId === id);
+    if (!key) return null;
+    const updated = { ...cases[key], ...patch };
+    cases[key] = updated;
+    saveAll(cases);
+    return updated;
+  } catch (e) {
+    console.error('[localCases] Update error:', e && e.message ? e.message : e);
+    return null;
+  }
+}

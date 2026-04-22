@@ -38,12 +38,23 @@ const SchedulePanel: React.FC<{
     const name = prompt('Week name', 'Week');
     if (!name) return;
     const date = prompt('Date (optional) - e.g. 01/02/2026', '');
+    const tempId = `tmp-${Date.now()}`;
+    const optimistic = { id: tempId, name, date: date || null, cases: [] as any[] };
+    setSchedules(prev => [optimistic, ...prev]);
     try {
       const r = await fetch(`${apiBase}/api/schedules`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, date }) });
       const j = await r.json();
-      if (j.ok) await fetchSchedules();
-      else alert('Failed to create week: ' + (j.error || 'unknown'));
+      if (j.ok && j.schedule) {
+        const normalized = { ...j.schedule, id: j.schedule.id || String(j.schedule._id) };
+        setSchedules(prev => prev.map(x => x.id === tempId ? normalized : x));
+      } else if (j.ok) {
+        await fetchSchedules();
+      } else {
+        setSchedules(prev => prev.filter(x => x.id !== tempId));
+        alert('Failed to create week: ' + (j.error || 'unknown'));
+      }
     } catch (e) {
+      setSchedules(prev => prev.filter(x => x.id !== tempId));
       console.error('Add week failed', e);
     }
   };
@@ -56,19 +67,28 @@ const SchedulePanel: React.FC<{
     try {
       const r = await fetch(`${apiBase}/api/schedules/${encodeURIComponent(s.id)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, date }) });
       const j = await r.json();
-      if (j.ok) await fetchSchedules();
+      if (j.ok) {
+        setSchedules(prev => prev.map(x => x.id === s.id ? { ...x, name, date } : x));
+      }
       else alert('Failed: ' + (j.error || 'unknown'));
     } catch (e) { console.error('Rename week failed', e); }
   };
 
   const handleDeleteWeek = async (s: any) => {
     if (!confirm('Delete this week and its scheduled items?')) return;
+    const snapshot = schedules;
     try {
+      setSchedules(prev => prev.filter(x => x.id !== s.id));
       const r = await fetch(`${apiBase}/api/schedules/${encodeURIComponent(s.id)}`, { method: 'DELETE' });
       const j = await r.json();
-      if (j.ok) await fetchSchedules();
-      else alert('Failed: ' + (j.error || 'unknown'));
-    } catch (e) { console.error('Delete week failed', e); }
+      if (!j.ok) {
+        setSchedules(snapshot);
+        alert('Failed: ' + (j.error || 'unknown'));
+      }
+    } catch (e) {
+      setSchedules(snapshot);
+      console.error('Delete week failed', e);
+    }
   };
 
   const handleUploadNewCase = (s: any) => {
@@ -86,9 +106,14 @@ const SchedulePanel: React.FC<{
     try {
       const res = await uploadDocument(file, `Schedule upload for ${file.name}`);
       if (res?.id) {
-        await fetch(`${apiBase}/api/schedules/${encodeURIComponent(scheduleId)}/cases`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ caseId: res.id, title: file.name }) });
+        const rr = await fetch(`${apiBase}/api/schedules/${encodeURIComponent(scheduleId)}/cases`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ caseId: res.id, title: file.name }) });
+        const jj = await rr.json().catch(() => null);
+        if (jj?.ok && jj?.added) {
+          setSchedules(prev => prev.map(s => s.id === scheduleId ? { ...s, cases: [...(s.cases || []), jj.added] } : s));
+        } else {
+          await fetchSchedules();
+        }
         await refreshCases();
-        await fetchSchedules();
       }
     } catch (err) {
       console.error('Upload to schedule failed', err);
@@ -98,12 +123,23 @@ const SchedulePanel: React.FC<{
 
   const handleAddExistingCase = async (s: any, chosen: { id: string; name: string }) => {
     setAddCaseMenu(null);
+    const tempEntry = { id: `tmp-${Date.now()}`, caseId: chosen.id, title: chosen.name };
+    setSchedules(prev => prev.map(x => x.id === s.id ? { ...x, cases: [...(x.cases || []), tempEntry] } : x));
     try {
       const r = await fetch(`${apiBase}/api/schedules/${encodeURIComponent(s.id)}/cases`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ caseId: chosen.id, title: chosen.name }) });
       const j = await r.json();
-      if (j.ok) await fetchSchedules();
-      else alert('Failed to add: ' + (j.error || 'unknown'));
-    } catch (e) { console.error('Add case to week failed', e); }
+      if (j.ok && j.added) {
+        setSchedules(prev => prev.map(x => x.id === s.id ? { ...x, cases: (x.cases || []).map((c: any) => c.id === tempEntry.id ? j.added : c) } : x));
+      } else if (j.ok) {
+        await fetchSchedules();
+      } else {
+        setSchedules(prev => prev.map(x => x.id === s.id ? { ...x, cases: (x.cases || []).filter((c: any) => c.id !== tempEntry.id) } : x));
+        alert('Failed to add: ' + (j.error || 'unknown'));
+      }
+    } catch (e) {
+      setSchedules(prev => prev.map(x => x.id === s.id ? { ...x, cases: (x.cases || []).filter((c: any) => c.id !== tempEntry.id) } : x));
+      console.error('Add case to week failed', e);
+    }
   };
 
   const handleRenameCaseEntry = async (s: any, entry: any) => {
@@ -113,19 +149,28 @@ const SchedulePanel: React.FC<{
     try {
       const r = await fetch(`${apiBase}/api/schedules/${encodeURIComponent(s.id)}/cases/${encodeURIComponent(entry.id)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title.trim() }) });
       const j = await r.json();
-      if (j.ok) await fetchSchedules();
+      if (j.ok) {
+        setSchedules(prev => prev.map(x => x.id === s.id ? { ...x, cases: (x.cases || []).map((c: any) => c.id === entry.id ? { ...c, title: title.trim() } : c) } : x));
+      }
       else alert('Failed: ' + (j.error || 'unknown'));
     } catch (e) { console.error('Rename case entry failed', e); }
   };
 
   const handleRemoveCaseEntry = async (s: any, entry: any) => {
     if (!confirm('Remove this case from the week?')) return;
+    const snapshot = schedules;
     try {
+      setSchedules(prev => prev.map(x => x.id === s.id ? { ...x, cases: (x.cases || []).filter((c: any) => c.id !== entry.id) } : x));
       const r = await fetch(`${apiBase}/api/schedules/${encodeURIComponent(s.id)}/cases/${encodeURIComponent(entry.id)}`, { method: 'DELETE' });
       const j = await r.json();
-      if (j.ok) await fetchSchedules();
-      else alert('Failed: ' + (j.error || 'unknown'));
-    } catch (e) { console.error('Remove case entry failed', e); }
+      if (!j.ok) {
+        setSchedules(snapshot);
+        alert('Failed: ' + (j.error || 'unknown'));
+      }
+    } catch (e) {
+      setSchedules(snapshot);
+      console.error('Remove case entry failed', e);
+    }
   };
 
   return (

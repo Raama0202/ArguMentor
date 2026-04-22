@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import mammoth from 'mammoth';
-import fetch from 'node-fetch';
+import { callLLM } from '../lib/llm.js';
 import { resolveCase } from '../lib/caseResolver.js';
 
 const router = express.Router();
@@ -49,26 +49,14 @@ async function loadTemplateText(filePath, mimetype) {
 }
 
 async function generateMemoFromTemplate(templateText, caseDoc) {
-  const apiKey = process.env.MISTRAL_API_KEY;
-  const endpoint = process.env.MISTRAL_API_URL || 'https://api.mistral.ai/v1/chat/completions';
-  const model = process.env.MISTRAL_MODEL || 'mistral-small-latest';
-
-  if (!apiKey) {
-    throw new Error('Mistral 7B API not configured. Please set MISTRAL_API_KEY in server/.env');
-  }
-
-  const headers = {
-    'Authorization': `Bearer ${apiKey}`,
-    'Content-Type': 'application/json'
-  };
-
   const text = (caseDoc?.extraction?.text || '').slice(0, 20000);
   const structured = caseDoc?.inference?.structured || {};
   const summary = caseDoc?.inference?.summary || '';
 
   const systemPrompt =
     'You are a senior legal drafting assistant. You fill legal memorandum templates for lawyers. ' +
-    'Always keep the template structure, headings, and numbering, only replacing placeholders with well-written legal prose.';
+    'Always keep the template structure, headings, and numbering, only replacing placeholders with comprehensive, detailed legal prose. ' +
+    'Provide in-depth analysis, cite relevant case law and statutes, and include thorough reasoning.';
 
   const userContent = [
     'You are given a legal memo template and case context.',
@@ -88,48 +76,26 @@ async function generateMemoFromTemplate(templateText, caseDoc) {
     'Source text excerpt:',
     text,
     '',
-    'Task: Fill in the template with a professional legal memorandum for this case.',
+    'Task: Fill in the template with a comprehensive legal memorandum for this case.',
     '- Preserve the template headings and formatting as much as possible in plain text.',
-    '- Replace each placeholder with detailed but concise content grounded in the case context.',
-    '- Use clear paragraphs and bullet or numbered lists where appropriate.',
+    '- Replace each placeholder with detailed, thorough content including legal citations, case references, and in-depth analysis.',
+    '- Use comprehensive paragraphs and detailed bullet or numbered lists where appropriate.',
+    '- Include relevant statutes, landmark cases, and legal principles with proper citations.',
+    '- Provide extensive reasoning and multiple perspectives where applicable.',
     '',
     'Return ONLY the completed memorandum text. Do NOT add explanations, markdown code fences, or any commentary.'
   ].join('\n');
 
-  const body = JSON.stringify({
-    model,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userContent }
-    ],
-    temperature: 0.3,
-    max_tokens: 2000
-  });
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: userContent }
+  ];
 
-  const resp = await fetch(endpoint, { method: 'POST', headers, body });
-  if (!resp.ok) {
-    const textBody = await resp.text().catch(() => '');
-    throw new Error(`Mistral 7B API error: ${resp.status} ${resp.statusText} ${textBody.slice(0, 200)}`);
-  }
+  const { raw } = await callLLM(messages, { max_tokens: 4000, temperature: 0.3 });
+  const memoText = String(raw || '').trim();
 
-  const data = await resp.json();
-  let memoText = '';
-  if (data && Array.isArray(data.choices) && data.choices.length > 0) {
-    const first = data.choices[0];
-    if (first.message && typeof first.message.content === 'string') {
-      memoText = first.message.content;
-    } else if (first.delta && typeof first.delta.content === 'string') {
-      memoText = first.delta.content;
-    }
-  }
-
-  if (!memoText && typeof data.generated_text === 'string') {
-    memoText = data.generated_text;
-  }
-
-  memoText = (memoText || '').trim();
   if (!memoText) {
-    throw new Error('Mistral 7B returned empty memo content');
+    throw new Error('LLM returned empty memo content');
   }
 
   return memoText;
@@ -182,6 +148,44 @@ router.post('/memo/generate', upload.single('template'), async (req, res) => {
       }
     } catch {
       // ignore
+    }
+  }
+});
+
+router.post('/memo/generate-default', async (req, res) => {
+  try {
+    const db = req.db;
+    const { caseId, caseTitle } = req.body || {};
+    const caseIdentifier = caseId || caseTitle;
+
+    if (!caseIdentifier) {
+      return res.status(400).json({ ok: false, error: 'caseId (or caseTitle) is required' });
+    }
+
+    const doc = await resolveCase(db, caseIdentifier);
+    if (!doc) {
+      return res.status(404).json({ ok: false, error: 'Case not found' });
+    }
+
+    const defaultTemplatePath = path.join(templatesDir, 'default-template.txt');
+    if (!fs.existsSync(defaultTemplatePath)) {
+      return res.status(500).json({ ok: false, error: 'Default template not found' });
+    }
+
+    const templateText = fs.readFileSync(defaultTemplatePath, 'utf8');
+    const memoText = await generateMemoFromTemplate(templateText, doc);
+
+    const filename = `legal-memo-${caseIdentifier.replace(/[^a-zA-Z0-9]/g, '-')}-${Date.now()}.txt`;
+
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.send(memoText);
+  } catch (e) {
+    console.error('[memo] Error generating default memo:', e && e.message ? e.message : e);
+    if (!res.headersSent) {
+      return res
+        .status(500)
+        .json({ ok: false, error: e && e.message ? e.message : 'Failed to generate memo' });
     }
   }
 });

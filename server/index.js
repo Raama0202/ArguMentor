@@ -25,6 +25,7 @@ import memoRouter from './routes/memo.js';
 import cors from 'cors';
 import http from 'http';
 import { Server as SocketIOServer } from 'socket.io';
+import { spawnSync } from 'child_process';
 
 const app = express();
 const server = http.createServer(app);
@@ -60,11 +61,14 @@ const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017';
 const mongoDbName = process.env.MONGODB_DB || 'argumentor';
 
 let mongoClient; // shared client
+let mongoConnected = false;
+
+function isMongoConnected() {
+  return mongoConnected === true;
+}
+
 async function initMongo() {
-  if (mongoClient && mongoClient.topology && mongoClient.topology.isConnected()) {
-    console.log('[server] MongoDB already connected');
-    return;
-  }
+  if (mongoClient && isMongoConnected()) return;
   
   const baseOptions = {
     ignoreUndefined: true,
@@ -118,10 +122,12 @@ async function initMongo() {
       const collections = await db.listCollections().toArray();
       console.log(`[server] Collections found: ${collections.length}`);
 
+      mongoConnected = true;
       app.set('mongoConnected', true);
       return;
     } catch (err) {
       lastErr = err;
+      mongoConnected = false;
       console.error('[server] ❌ Failed to connect to MongoDB with URI:', candidate.replace(/\/\/[^:]+:[^@]+@/, '//***:***@'));
       console.error('[server] Error message:', err && err.message ? err.message : err);
       console.error('[server] Error code:', err?.code);
@@ -137,6 +143,7 @@ async function initMongo() {
   if (lastErr) {
     console.error('[server] Last error message:', lastErr?.message);
   }
+  mongoConnected = false;
   app.set('mongoConnected', false);
 }
 
@@ -156,8 +163,14 @@ try {
 try {
   const venvPython = path.join(__dirname, '..', '.venv', 'Scripts', 'python.exe');
   if (!process.env.PYTHON_BIN && fs.existsSync(venvPython)) {
-    process.env.PYTHON_BIN = venvPython;
-    console.log('[server] Set PYTHON_BIN to workspace venv:', venvPython);
+    // Some Windows store/launcher shims exist at this path but are not runnable.
+    const r = spawnSync(venvPython, ['--version'], { windowsHide: true, encoding: 'utf8' });
+    if (r.status === 0) {
+      process.env.PYTHON_BIN = venvPython;
+      console.log('[server] Set PYTHON_BIN to workspace venv:', venvPython);
+    } else {
+      console.warn('[server] Workspace venv python is not runnable; skipping PYTHON_BIN override');
+    }
   }
 } catch (e) {
   // ignore
@@ -166,7 +179,7 @@ try {
 // Inject db into request
 app.use(async (req, res, next) => {
   try {
-    if (!mongoClient || !mongoClient.topology || !mongoClient.topology.isConnected()) {
+    if (!mongoClient || !isMongoConnected()) {
       try { 
         await initMongo(); 
       } catch (e) { 
@@ -174,7 +187,7 @@ app.use(async (req, res, next) => {
         console.warn('[server] MongoDB unavailable for request, continuing with fallback');
       }
     }
-    if (mongoClient && mongoClient.topology && mongoClient.topology.isConnected()) {
+    if (mongoClient && isMongoConnected()) {
       req.db = mongoClient.db(mongoDbName);
     } else {
       // Set a flag so routes know MongoDB isn't available
@@ -197,6 +210,8 @@ app.use('/api', memoryRouter);
 app.use('/api', schedulesRouter);
 app.use('/api', memoRouter);
 app.use('/api/test', testRouter);
+// Compatibility: allow `/api/test-mongo`, `/api/test/all`, etc.
+app.use('/api', testRouter);
 
 // Multer / upload error handler - return JSON responses for common upload errors (file size, unsupported type)
 app.use((err, req, res, next) => {
@@ -220,14 +235,14 @@ app.use((err, req, res, next) => {
 // Health endpoint for quick checks
 app.get('/health', async (req, res) => {
   const env = {
-    hasGroqKey: !!(process.env.GROQ_API_KEY),
+    hasMistralKey: !!(process.env.MISTRAL_API_KEY || process.env.MISTRAL_KEY || process.env.HF_TOKEN),
     mongoUriConfigured: !!process.env.MONGODB_URI
   };
 
   // try quick mongo ping if client exists
   let mongo = { connected: false };
   try {
-    if (mongoClient && mongoClient.topology && mongoClient.topology.isConnected()) {
+    if (mongoClient && isMongoConnected()) {
       mongo.connected = true;
     } else if (app.get('mongoConnected')) {
       mongo.connected = true;
@@ -279,7 +294,7 @@ server.listen(port, () => {
   console.log(`${'='.repeat(60)}`);
   console.log(`[server] ✅ Server listening on http://localhost:${port}`);
   console.log(`[server] Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`[server] Groq API: ${process.env.GROQ_API_KEY ? '✅ Configured' : '❌ Not set'}`);
+  console.log(`[server] Mistral API: ${(process.env.MISTRAL_API_KEY || process.env.MISTRAL_KEY || process.env.HF_TOKEN) ? '✅ Configured' : '❌ Not set'}`);
   console.log(`[server] MongoDB URI: ${process.env.MONGODB_URI ? '✅ Configured' : '❌ Not set'}`);
   
   // Initialize MongoDB connection
@@ -290,7 +305,7 @@ server.listen(port, () => {
   console.log(`[server] 📊 Test endpoints:`);
   console.log(`[server]   GET /api/test/all     - Full system health check`);
   console.log(`[server]   GET /api/test-mongo   - MongoDB connectivity`);
-  console.log(`[server]   GET /api/test-groq    - Groq API test`);
+  console.log(`[server]   GET /api/test-mistral - Mistral API test`);
   console.log(`[server]   GET /api/test-python  - Python interpreter test`);
   console.log(`[server]   GET /api/test-env     - Environment variables`);
   console.log(`[server]`);

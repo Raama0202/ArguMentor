@@ -9,7 +9,7 @@ echo ========================================
 echo.
 
 cd server
-npm start
+..\tools\node-v20.11.1-win-x64\node.exe index.js
 
 pause
 

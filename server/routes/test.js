@@ -1,12 +1,18 @@
 import express from 'express';
-import fetch from 'node-fetch';
-import { callGroq } from '../lib/groqClient.js';
+import { callLLM } from '../lib/llm.js';
 
 const router = express.Router();
 
 /**
  * Comprehensive test endpoint for debugging all AI services
  */
+
+// Backwards-compatible aliases (README/server banner expects these)
+router.get('/all', (req, res, next) => { req.url = '/test-all'; next(); });
+router.get('/mongo', (req, res, next) => { req.url = '/test-mongo'; next(); });
+router.get('/mistral', (req, res, next) => { req.url = '/test-mistral'; next(); });
+router.get('/python', (req, res, next) => { req.url = '/test-python'; next(); });
+router.get('/env', (req, res, next) => { req.url = '/test-env'; next(); });
 
 // Test MongoDB connection
 router.get('/test-mongo', async (req, res) => {
@@ -45,46 +51,24 @@ router.get('/test-mongo', async (req, res) => {
   }
 });
 
-// Test Mistral API (legacy)
+// Test Mistral API
 router.get('/test-mistral', async (req, res) => {
-  // Keep as-is but mark as SKIP when not configured
-  const endpoint = process.env.MISTRAL_HF_ENDPOINT_URL;
-  const mistralToken = process.env.MISTRAL_KEY || process.env.HF_TOKEN;
-  if (!endpoint || !mistralToken) {
-    return res.status(200).json({ ok: false, service: 'Mistral API', status: 'SKIP', message: 'Not configured' });
-  }
-  return res.json({ ok: true, service: 'Mistral API', status: 'CONFIGURED', endpoint: endpoint.substring(0, 80) + '...' });
-});
-
-// Test Groq API (replaces legacy Gemini test)
-router.get('/test-groq', async (req, res) => {
   try {
-    const apiKey = process.env.GROQ_API_KEY;
-    const model = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
-
-    if (!apiKey) {
-      console.warn('[test-groq] FAIL - GROQ_API_KEY not set');
-      return res.status(400).json({ ok: false, service: 'Groq API', status: 'NOT_CONFIGURED', error: 'GROQ_API_KEY not set' });
+    if (!(process.env.MISTRAL_API_KEY || process.env.MISTRAL_KEY || process.env.HF_TOKEN)) {
+      return res.status(400).json({ ok: false, service: 'Mistral API', status: 'NOT_CONFIGURED', error: 'MISTRAL_API_KEY not set' });
     }
 
     const messages = [
-      { role: 'system', content: 'You are a diagnostic assistant. Reply with "Groq OK" only.' },
-      { role: 'user', content: 'Sanity check: respond with Groq OK' }
+      { role: 'system', content: 'You are a diagnostic assistant. Reply with "Mistral OK" only.' },
+      { role: 'user', content: 'Sanity check: respond with Mistral OK' }
     ];
 
-    let out;
-    try {
-      out = await callGroq(messages, { models: [model] });
-    } catch (e) {
-      console.error('[test-groq] Groq call failed:', e.message || e);
-      return res.status(502).json({ ok: false, service: 'Groq API', status: 'FAILED', error: e.message || String(e) });
-    }
-
-    const reply = out?.choices?.[0]?.message?.content || out?.choices?.[0]?.text || (out?.raw || '').toString();
-    return res.json({ ok: true, service: 'Groq API', status: 'WORKING', model, reply: String(reply).slice(0, 200) });
+    const out = await callLLM(messages, { max_tokens: 30, temperature: 0 });
+    const reply = String(out?.raw || '').slice(0, 200);
+    return res.json({ ok: true, service: 'Mistral API', status: 'WORKING', model: out?.meta?.model, reply });
   } catch (e) {
-    console.error('[test-groq] ERROR:', e && e.message ? e.message : e);
-    return res.status(500).json({ ok: false, service: 'Groq API', status: 'ERROR', error: e.message || String(e) });
+    console.error('[test-mistral] ERROR:', e && e.message ? e.message : e);
+    return res.status(500).json({ ok: false, service: 'Mistral API', status: 'ERROR', error: e.message || String(e) });
   }
 });
 
@@ -219,8 +203,8 @@ router.get('/test-python-run', async (req, res) => {
 // Test environment variables
 router.get('/test-env', (req, res) => {
   const requiredVars = {
-    'GROQ_API_KEY': process.env.GROQ_API_KEY,
-    'GROQ_MODEL': process.env.GROQ_MODEL,
+    'MISTRAL_API_KEY': process.env.MISTRAL_API_KEY || process.env.MISTRAL_KEY || process.env.HF_TOKEN,
+    'MISTRAL_MODEL': process.env.MISTRAL_MODEL,
     'MONGODB_URI': process.env.MONGODB_URI,
     'MONGODB_DB': process.env.MONGODB_DB,
     'PORT': process.env.PORT
@@ -273,66 +257,29 @@ router.get('/test-all', async (req, res) => {
   // Test MongoDB
   try {
     const db = req.db;
-    if (!db) throw new Error('Database not available');
+    if (!db) {
+      results.tests.mongodb = { status: 'SKIP', message: 'MongoDB not available (using local fallback storage)' };
+      console.log('[test-all] MongoDB: SKIP (fallback mode)');
+    } else {
     await db.admin().command({ ping: 1 });
     results.tests.mongodb = { status: 'PASS', message: 'Connected' };
     console.log('[test-all] MongoDB: PASS');
+    }
   } catch (e) {
     results.tests.mongodb = { status: 'FAIL', message: e.message };
     console.error('[test-all] MongoDB: FAIL -', e.message);
   }
 
-  // Test Groq
+  // Test Mistral
   try {
-    const apiKey = process.env.GROQ_API_KEY;
-    if (!apiKey) throw new Error('GROQ_API_KEY not set');
-
-    const model = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
     const messages = [
-      { role: 'system', content: 'You are a diagnostic assistant. Reply with "OK".' },
+      { role: 'system', content: 'You are a diagnostic assistant. Reply with "Mistral OK".' },
       { role: 'user', content: 'test' }
     ];
-
-    const out = await callGroq(messages, { models: [model], extra: { max_tokens: 10, temperature: 0 } });
-    const reply = out?.choices?.[0]?.message?.content || out?.choices?.[0]?.text || (out?.raw || '').toString();
-    results.tests.groq = { status: 'PASS', message: String(reply).slice(0, 100) };
-    console.log('[test-all] Groq: PASS');
-  } catch (e) {
-    results.tests.groq = { status: 'FAIL', message: e.message };
-    console.error('[test-all] Groq: FAIL -', e.message);
-  }
-
-  // Test Mistral (if configured)
-  try {
-    const endpoint = process.env.MISTRAL_HF_ENDPOINT_URL;
-    const mistralToken = process.env.MISTRAL_KEY || process.env.HF_TOKEN;
-    
-    if (!endpoint || !mistralToken) {
-      results.tests.mistral = { status: 'SKIP', message: 'Not configured' };
-      console.log('[test-all] Mistral: SKIP (not configured)');
-    } else {
-      const payload = {
-        model: "mistral-7b-instruct",
-        messages: [{ role: "user", content: "test" }],
-        max_tokens: 10
-      };
-      
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${mistralToken}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-      });
-
-      if (response.ok) {
-        results.tests.mistral = { status: 'PASS', message: 'API responding' };
-        console.log('[test-all] Mistral: PASS');
-      } else {
-        throw new Error(`HTTP ${response.status}`);
-      }
-    }
+    const out = await callLLM(messages, { max_tokens: 20, temperature: 0 });
+    const reply = String(out?.raw || '');
+    results.tests.mistral = { status: 'PASS', message: String(reply).slice(0, 100) };
+    console.log('[test-all] Mistral: PASS');
   } catch (e) {
     results.tests.mistral = { status: 'FAIL', message: e.message };
     console.error('[test-all] Mistral: FAIL -', e.message);
@@ -364,7 +311,7 @@ router.get('/test-all', async (req, res) => {
   }
 
   // Test Environment
-  const requiredVars = ['GROQ_API_KEY', 'MONGODB_URI'];
+  const requiredVars = ['MISTRAL_API_KEY'];
   const missingVars = requiredVars.filter(v => !process.env[v]);
   
   results.tests.environment = {
@@ -374,8 +321,8 @@ router.get('/test-all', async (req, res) => {
   console.log('[test-all] Environment:', results.tests.environment.status);
 
   // Summary
-  const criticalTests = ['mongodb', 'groq', 'environment'];
-  const criticalPassed = criticalTests.every(t => results.tests[t]?.status === 'PASS');
+  const criticalTests = ['mongodb', 'mistral', 'environment'];
+  const criticalPassed = criticalTests.every(t => results.tests[t]?.status === 'PASS' || results.tests[t]?.status === 'SKIP');
   const allPassed = Object.values(results.tests).every(t => t.status === 'PASS' || t.status === 'SKIP');
   
   results.summary = {
